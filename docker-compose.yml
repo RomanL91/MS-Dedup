@@ -1,0 +1,43 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Порт наружу НЕ публикуем — Redis доступен только внутри сети compose.
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  app:
+    build: .
+    image: ms-dedup:latest
+    restart: unless-stopped
+    # Единственный порт наружу — веб-интерфейс приложения.
+    ports:
+      - "${FLET_PORT:-8080}:8080"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - FLET_PORT=8080
+      - MS_API_BASE=${MS_API_BASE:-https://api.moysklad.ru/api/remap/1.2}
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: python -m app.main
+
+  worker:
+    build: .
+    image: ms-dedup:latest
+    restart: unless-stopped
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - MS_API_BASE=${MS_API_BASE:-https://api.moysklad.ru/api/remap/1.2}
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: taskiq worker app.broker:broker app.tasks
+
+volumes:
+  redis-data:

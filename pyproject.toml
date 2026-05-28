@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "ms-dedup"
+version = "0.1.0"
+description = "Web app for deduplicating products in MoySklad"
+authors = ["MS Dedup"]
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.11"
+flet = ">=0.25,<0.26"
+taskiq = ">=0.11"
+taskiq-redis = ">=1.0"
+httpx = ">=0.27"
+redis = ">=5.0"
+pydantic = ">=2.5"
+pydantic-settings = ">=2.1"
+python-dotenv = ">=1.0"
+tzdata = ">=2024.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
