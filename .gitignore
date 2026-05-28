@@ -8,5 +8,4 @@ venv/
 .idea/
 .vscode/
 *.log
-poetry.lock
 .DS_Store
