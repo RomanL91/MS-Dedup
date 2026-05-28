@@ -80,7 +80,7 @@ cp .env.example .env
 docker run -p 6379:6379 redis:7-alpine
 
 # 2) Worker (в отдельном терминале)
-poetry run taskiq worker app.broker:broker app.tasks
+poetry run taskiq worker app.core.broker:broker app.services.deduplication
 
 # 3) UI (в отдельном терминале)
 poetry run python -m app.main

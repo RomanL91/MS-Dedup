@@ -37,7 +37,7 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    command: taskiq worker app.broker:broker app.tasks
+    command: taskiq worker app.core.broker:broker app.services.deduplication
 
 volumes:
   redis-data:
