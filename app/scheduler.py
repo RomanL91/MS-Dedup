@@ -89,6 +89,8 @@ def _scheduled_payload(
     cleanup_mode: str,
     auto_confirm: bool,
     scheduled_at_ms: int,
+    target_type: str = "",
+    replace_types: dict[str, str] | None = None,
 ) -> str:
     return json.dumps(
         {
@@ -98,6 +100,8 @@ def _scheduled_payload(
             "replace_ids": replace_ids,
             "target_id": target_id,
             "entity_type": entity_type,
+            "target_type": target_type,
+            "replace_types": replace_types or {},
             "cleanup_mode": cleanup_mode,
             "auto_confirm": auto_confirm,
             "scheduled_at_ms": scheduled_at_ms,
@@ -117,6 +121,8 @@ async def enqueue_scheduled(
     cleanup_mode: str,
     auto_confirm: bool,
     scheduled_at_ms: int,
+    target_type: str = "",
+    replace_types: dict[str, str] | None = None,
 ) -> None:
     payload = _scheduled_payload(
         task_id=task_id,
@@ -125,6 +131,8 @@ async def enqueue_scheduled(
         replace_ids=replace_ids,
         target_id=target_id,
         entity_type=entity_type,
+        target_type=target_type,
+        replace_types=replace_types or {},
         cleanup_mode=cleanup_mode,
         auto_confirm=auto_confirm,
         scheduled_at_ms=scheduled_at_ms,
@@ -234,6 +242,8 @@ async def scheduler_loop(redis_url: str) -> None:
                             payload.get("entity_type", "product"),
                             payload.get("cleanup_mode", "archive"),
                             payload.get("auto_confirm", False),
+                            payload.get("target_type") or None,
+                            payload.get("replace_types") or None,
                         )
                         await remove_scheduled(redis, task_id)
                         log.info("Scheduler launched task %s", task_id)

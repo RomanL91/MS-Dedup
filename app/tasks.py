@@ -71,7 +71,8 @@ async def _scan_document(
     doc_type: str,
     replace_ids_set: set[str],
     target_id: str,
-    entity_type: str,
+    target_type: str,
+    replace_types: dict[str, str],
 ) -> list[AffectedPosition]:
     rows, positions_meta = _extract_positions_rows(doc)
     # Если expand=positions не вернул rows, или вернул меньше чем size,
@@ -90,19 +91,23 @@ async def _scan_document(
             )
 
     target_pos: dict | None = None
-    replace_positions: list[tuple[str, dict]] = []
+    # (pid, position, тип_позиции) — тип нужен для корректной чистки разнотипных дублей
+    replace_positions: list[tuple[str, dict, str]] = []
     for p in rows:
         assortment_meta = (p.get("assortment") or {}).get("meta") or {}
         href = assortment_meta.get("href") or ""
         pos_entity_type = assortment_meta.get("type") or ""
-        # фильтруем позиции по типу сущности (product vs variant)
-        if not href or pos_entity_type != entity_type:
+        if not href:
             continue
         pid = extract_id_from_href(href)
-        if pid == target_id and target_pos is None:
+        # Матчим позицию по id И типу: целевая сущность должна совпасть и по
+        # target_type, дубль — по своему типу из replace_types. Это позволяет
+        # смешивать типы (товар→модификация и т.п.), не путая сущности с
+        # одинаковым id в разных таблицах МС.
+        if pid == target_id and pos_entity_type == target_type and target_pos is None:
             target_pos = p
-        elif pid in replace_ids_set:
-            replace_positions.append((pid, p))
+        elif pid in replace_ids_set and pos_entity_type == replace_types.get(pid):
+            replace_positions.append((pid, p, pos_entity_type))
 
     if not replace_positions:
         return []
@@ -128,7 +133,7 @@ async def _scan_document(
     doc_uuid_href = (doc.get("meta") or {}).get("uuidHref")
 
     affected: list[AffectedPosition] = []
-    for replace_id, p in replace_positions:
+    for replace_id, p, pos_entity_type in replace_positions:
         replace_assortment_meta = (p.get("assortment") or {}).get("meta") or {}
         affected.append(
             AffectedPosition(
@@ -138,8 +143,8 @@ async def _scan_document(
                 position_id=p.get("id", ""),
                 position_href=(p.get("meta") or {}).get("href", ""),
                 replace_id=replace_id,
-                replace_entity_type=entity_type,
-                target_entity_type=entity_type,
+                replace_entity_type=pos_entity_type,
+                target_entity_type=target_type,
                 quantity=float(p.get("quantity") or 0),
                 has_target_already=target_pos is not None,
                 target_position_href=target_position_href,
@@ -158,7 +163,8 @@ async def _phase_scan(
     task_id: str,
     replace_ids: list[str],
     target_id: str,
-    entity_type: str,
+    target_type: str,
+    replace_types: dict[str, str],
 ) -> list[AffectedPosition] | None:
     """Возвращает список затронутых позиций, либо None если процесс отменён."""
     replace_ids_set = set(replace_ids)
@@ -202,7 +208,8 @@ async def _phase_scan(
 
             for doc in rows:
                 doc_affected = await _scan_document(
-                    client, doc, doc_type, replace_ids_set, target_id, entity_type
+                    client, doc, doc_type, replace_ids_set,
+                    target_id, target_type, replace_types,
                 )
                 affected.extend(doc_affected)
 
@@ -232,14 +239,14 @@ async def _phase_replace(
     task_id: str,
     affected: list[AffectedPosition],
     target_id: str,
-    entity_type: str,
+    target_type: str,
 ) -> tuple[int, set[str], bool]:
     """Возвращает (успешных_замен, id_сущностей_с_ошибкой_замены, был_ли_отменён).
 
     Если хотя бы одна позиция сущности не заменилась, её replace_id попадает в
     failed_ids — такую сущность нельзя архивировать/удалять (ссылка ещё жива).
     """
-    target_href = build_entity_href(entity_type, target_id, client.base_url)
+    target_href = build_entity_href(target_type, target_id, client.base_url)
     total = len(affected)
     replaced = 0
     failed_ids: set[str] = set()
@@ -272,7 +279,7 @@ async def _phase_replace(
                 )
             else:
                 await client.update_position(
-                    ap.position_href, target_href, entity_type
+                    ap.position_href, target_href, target_type
                 )
             replaced += 1
         except MSRequestError as e:
@@ -306,19 +313,29 @@ async def _phase_delete(
     task_id: str,
     replace_ids: list[str],
     replaced_count: int,
-    entity_type: str,
+    replace_types: dict[str, str],
     cleanup_mode: str,
 ) -> tuple[int, list[str], bool]:
     """Финальная фаза: архивация или удаление дублей.
 
     cleanup_mode = "archive" — PUT {"archived": true} (по умолчанию).
     cleanup_mode = "delete"  — DELETE /entity/{type}/{id}.
+
+    Каждый дубль архивируется/удаляется с его собственным типом из replace_types,
+    поэтому в одной задаче могут быть разнотипные дубли.
     """
     total = len(replace_ids)
     deleted = 0
     errors: list[str] = []
-    entity_label = ENTITY_TYPES.get(entity_type, entity_type)
-    entity_label_plural = ENTITY_TYPE_NAMES_PLURAL.get(entity_type, "товаров")
+    # Если все дубли одного типа — конкретная метка («товаров»), иначе обобщённая.
+    cleanup_type_set = {replace_types.get(pid, "product") for pid in replace_ids}
+    if len(cleanup_type_set) == 1:
+        only_type = next(iter(cleanup_type_set))
+        entity_label = ENTITY_TYPES.get(only_type, only_type)
+        entity_label_plural = ENTITY_TYPE_NAMES_PLURAL.get(only_type, "товаров")
+    else:
+        entity_label = "Дубль"
+        entity_label_plural = "дублей"
     is_archive = cleanup_mode == "archive"
     verb_gerund = "Архивирование" if is_archive else "Удаление"
     verb_past = "не архивирован" if is_archive else "не удалён"
@@ -336,10 +353,11 @@ async def _phase_delete(
         if await is_cancelled(redis, task_id):
             return deleted, errors, True
         try:
+            pid_type = replace_types.get(pid, "product")
             if is_archive:
-                await client.archive_entity(entity_type, pid)
+                await client.archive_entity(pid_type, pid)
             else:
-                await client.delete_entity(entity_type, pid)
+                await client.delete_entity(pid_type, pid)
             deleted += 1
         except MSRequestError as e:
             msg = f"{entity_label} {pid} {verb_past}: {e}"
@@ -370,11 +388,22 @@ async def run_deduplication(
     entity_type: str = "product",
     cleanup_mode: str = "archive",
     auto_confirm: bool = False,
+    target_type: str | None = None,
+    replace_types: dict[str, str] | None = None,
 ) -> None:
     if entity_type not in ENTITY_TYPES:
         entity_type = "product"
     if cleanup_mode not in CLEANUP_MODES:
         cleanup_mode = "archive"
+    # Потиповая модель. Фолбэк на entity_type для обратной совместимости со
+    # старыми задачами в очереди (где target_type/replace_types отсутствуют).
+    target_type = target_type if target_type in ENTITY_TYPES else entity_type
+    replace_types = replace_types or {}
+    replace_types = {
+        pid: (replace_types.get(pid)
+              if replace_types.get(pid) in ENTITY_TYPES else entity_type)
+        for pid in replace_ids
+    }
     redis = Redis.from_url(settings.REDIS_URL, decode_responses=True)
     hb_task = asyncio.create_task(_heartbeat_loop(redis, task_id))
     try:
@@ -382,19 +411,25 @@ async def run_deduplication(
             try:
                 # Нормализация ID: у МС сущности могут быть UI id (из URL веб-интерфейса)
                 # и API id (из meta.href) — это разные значения. Везде дальше нужен API id.
+                # Резолвим каждый дубль с его собственным типом и переносим тип на
+                # реальный (API) id.
                 resolved_replace: list[str] = []
+                resolved_types: dict[str, str] = {}
                 for pid in replace_ids:
+                    pid_type = replace_types.get(pid, entity_type)
                     try:
-                        real = await client.resolve_entity_id(entity_type, pid)
+                        real = await client.resolve_entity_id(pid_type, pid)
                     except MSRequestError:
                         real = pid
                     if real != pid:
                         log.info("Resolved replace id %s -> %s", pid, real)
                     resolved_replace.append(real)
+                    resolved_types[real] = pid_type
                 replace_ids = resolved_replace
+                replace_types = resolved_types
 
                 try:
-                    real_target = await client.resolve_entity_id(entity_type, target_id)
+                    real_target = await client.resolve_entity_id(target_type, target_id)
                 except MSRequestError:
                     real_target = target_id
                 if real_target != target_id:
@@ -403,7 +438,8 @@ async def run_deduplication(
 
                 # фаза 1: SCANNING
                 affected = await _phase_scan(
-                    client, redis, task_id, replace_ids, target_id, entity_type
+                    client, redis, task_id, replace_ids, target_id,
+                    target_type, replace_types,
                 )
                 if affected is None:
                     await set_progress(
@@ -477,7 +513,7 @@ async def run_deduplication(
 
                 # фаза 2: REPLACING
                 replaced, failed_ids, was_cancelled = await _phase_replace(
-                    client, redis, task_id, affected, target_id, entity_type
+                    client, redis, task_id, affected, target_id, target_type
                 )
                 if was_cancelled:
                     await set_progress(
@@ -497,9 +533,14 @@ async def run_deduplication(
                 to_cleanup = [pid for pid in replace_ids if pid not in failed_ids]
                 skipped = [pid for pid in replace_ids if pid in failed_ids]
 
-                entity_label_plural = ENTITY_TYPE_NAMES_PLURAL.get(
-                    entity_type, "товаров"
-                )
+                # Метка для сообщений: конкретная при однородности, иначе обобщённая.
+                _type_set = {replace_types.get(pid, entity_type) for pid in replace_ids}
+                if len(_type_set) == 1:
+                    entity_label_plural = ENTITY_TYPE_NAMES_PLURAL.get(
+                        next(iter(_type_set)), "товаров"
+                    )
+                else:
+                    entity_label_plural = "дублей"
 
                 # режим "none": дубли не трогаем — только замена в документах
                 if cleanup_mode == "none":
@@ -538,7 +579,7 @@ async def run_deduplication(
                 # фаза 3: CLEANUP (архивация или удаление) — только успешно заменённые
                 deleted, errors, was_cancelled = await _phase_delete(
                     client, redis, task_id, to_cleanup, replaced,
-                    entity_type, cleanup_mode,
+                    replace_types, cleanup_mode,
                 )
                 if was_cancelled:
                     await set_progress(

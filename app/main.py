@@ -798,6 +798,11 @@ async def _open_new_process_dialog(
         value=False,
     )
 
+    allow_mixed_checkbox = ft.Checkbox(
+        label="Разрешить разные типы сущностей",
+        value=False,
+    )
+
     # ---- Расписание ----
     schedule_state: dict = {"dt": None}  # datetime в МСК или None (запуск сейчас)
     schedule_summary = ft.Text(
@@ -949,9 +954,11 @@ async def _open_new_process_dialog(
                             size=13,
                         ),
                         ft.Text(
-                            "• Все ID — одного типа: только Товары, только Услуги, "
-                            "только Модификации или только Комплекты. Смешивать "
-                            "нельзя.\n"
+                            "• По умолчанию все ID — одного типа: только Товары, "
+                            "только Услуги, только Модификации или только Комплекты. "
+                            "Чтобы дедуплицировать между разными типами (например, "
+                            "товар → модификация), включите «Разрешить разные типы "
+                            "сущностей» — тогда доступна полная комбинаторика.\n"
                             "• Целевой ID не должен быть среди дублей.\n"
                             "• Принимается: чистый UUID, ссылка из админки МС "
                             "(#good / #feature / #bundle) или прямая API-ссылка.\n"
@@ -1016,6 +1023,15 @@ async def _open_new_process_dialog(
                     ft.Text(
                         "Без галочки сервис сначала покажет карту замен и дождётся "
                         "вашего подтверждения.",
+                        size=11,
+                        color=ft.Colors.GREY,
+                    ),
+                    ft.Container(height=2),
+                    allow_mixed_checkbox,
+                    ft.Text(
+                        "По умолчанию все ID должны быть одного типа. Включите, чтобы "
+                        "дедуплицировать между разными типами (например, товар → "
+                        "модификация) — доступна полная комбинаторика.",
                         size=11,
                         color=ft.Colors.GREY,
                     ),
@@ -1105,18 +1121,23 @@ async def _open_new_process_dialog(
             page.update()
             return
 
+        # Разрешено ли смешивать типы (полная комбинаторика)
+        allow_mixed = bool(allow_mixed_checkbox.value)
+
         # 1) быстрая отбраковка: если по ссылкам однозначно определены ≥2 разных
         #    типов (например variant + bundle) — это точно микс, без обращения к API.
         #    #good-ссылки (товар/услуга неотличимы по URL) сюда не попадают — их тип
         #    определяется пробой ниже, поэтому глобальный тип здесь НЕ фиксируем.
+        #    При allow_mixed проверку пропускаем — разнотипность допустима.
         detected_types = {t for _, t in replace_entries if t is not None}
         if target_detected is not None:
             detected_types.add(target_detected)
-        if len(detected_types) > 1:
+        if len(detected_types) > 1 and not allow_mixed:
             error_text.value = (
                 "Нельзя смешивать разные типы. "
                 "Все позиции должны быть одного типа: "
-                "только Товары, Услуги, Модификации или Комплекты."
+                "только Товары, Услуги, Модификации или Комплекты. "
+                "Включите «Разрешить разные типы сущностей», если это намеренно."
             )
             page.update()
             return
@@ -1198,17 +1219,29 @@ async def _open_new_process_dialog(
             # 2) основная проверка однородности — по реально определённым типам
             #    (включая #good-id, чей тип стал известен только после пробы)
             probed_set = {t for t in probed_types.values() if t is not None}
-            if len(probed_set) > 1:
+            if len(probed_set) > 1 and not allow_mixed:
                 error_text.value = (
                     "Нельзя смешивать разные типы. "
                     "Все позиции должны быть одного типа: "
-                    "только Товары, Услуги, Модификации или Комплекты."
+                    "только Товары, Услуги, Модификации или Комплекты. "
+                    "Включите «Разрешить разные типы сущностей», если это намеренно."
                 )
                 run_btn.disabled = False
                 run_btn.text = "Запустить"
                 page.update()
                 return
+
+            # Потиповая модель: тип целевой сущности и карта тип-каждого-дубля.
+            # entity_type оставляем как «доминирующий» тип (для совместимости и меток
+            # в однородном случае).
+            target_type = probed_types.get(target_id) or "product"
+            replace_types = {
+                pid: (probed_types.get(pid) or "product") for pid in replace_ids
+            }
             entity_type = next(iter(probed_set), "product")
+            # При разрешённом миксе — ненавязчивое предупреждение (не блокирует запуск)
+            if len(probed_set) > 1:
+                log.info("on_run: mixed entity types allowed: %s", sorted(probed_set))
             cleanup_mode = cleanup_radio.value or "archive"
             auto_confirm = bool(auto_confirm_checkbox.value)
 
@@ -1244,6 +1277,8 @@ async def _open_new_process_dialog(
                         replace_ids=replace_ids,
                         target_id=target_id,
                         entity_type=entity_type,
+                        target_type=target_type,
+                        replace_types=replace_types,
                         cleanup_mode=cleanup_mode,
                         auto_confirm=auto_confirm,
                         scheduled_at_ms=scheduled_at_ms,
@@ -1266,6 +1301,8 @@ async def _open_new_process_dialog(
                         entity_type,
                         cleanup_mode,
                         auto_confirm,
+                        target_type,
+                        replace_types,
                     )
                     log.info("on_run: kiq enqueued")
                 except Exception as e:  # noqa: BLE001
@@ -1286,6 +1323,8 @@ async def _open_new_process_dialog(
                         replace_ids=replace_ids,
                         target_id=target_id,
                         entity_type=entity_type,
+                        target_type=target_type,
+                        replace_types=replace_types,
                         cleanup_mode=cleanup_mode,
                         auto_confirm=auto_confirm,
                         scheduled_at_ms=scheduled_at_ms,
@@ -1322,6 +1361,8 @@ async def _open_new_process_dialog(
                 cleanup_mode,
                 auto_confirm,
                 scheduled_at_ms,
+                target_type,
+                replace_types,
             )
             log.info("on_run: card created OK")
         finally:
@@ -1441,6 +1482,8 @@ async def _restore_user_cards(
                     meta.cleanup_mode,
                     meta.auto_confirm,
                     meta.scheduled_at_ms,
+                    meta.effective_target_type(),
+                    meta.effective_replace_types(),
                 )
             except asyncio.CancelledError:
                 raise
@@ -1474,13 +1517,32 @@ async def _add_process_card(
     cleanup_mode: str = "archive",
     auto_confirm: bool = False,
     scheduled_at_ms: int | None = None,
+    target_type: str = "",
+    replace_types: dict[str, str] | None = None,
 ) -> None:
     active = page.session.get("active_processes") or {}
     process_number = sum(1 for _ in processes_column.controls) + 1
 
-    entity_label = ENTITY_TYPES.get(entity_type, "Товар")
-    entity_label_plural = ENTITY_TYPE_GROUP_NAMES.get(entity_type, "Товары")
-    target_label_singular = ENTITY_TYPE_TARGET_NAMES.get(entity_type, "Целевой товар")
+    # Потиповая модель: определяем, однороден ли набор типов.
+    target_type = target_type or entity_type
+    replace_types = replace_types or {}
+    _all_types = {replace_types.get(pid, entity_type) for pid in replace_ids}
+    _all_types.add(target_type)
+    is_mixed = len(_all_types) > 1
+
+    if is_mixed:
+        # Метки обобщённые — в задаче участвуют разные типы.
+        entity_label = "Сущность"
+        entity_label_plural = "Сущности (разные типы)"
+        target_label_singular = (
+            f"Целевая сущность ({ENTITY_TYPES.get(target_type, target_type)})"
+        )
+    else:
+        entity_label = ENTITY_TYPES.get(entity_type, "Товар")
+        entity_label_plural = ENTITY_TYPE_GROUP_NAMES.get(entity_type, "Товары")
+        target_label_singular = ENTITY_TYPE_TARGET_NAMES.get(
+            entity_type, "Целевой товар"
+        )
     cleanup_mode_label = {
         "archive": "архивировать",
         "delete": "удалить",
@@ -1511,6 +1573,17 @@ async def _add_process_card(
         f"Действие с дублями: {cleanup_mode_label}",
         size=12,
         color=ft.Colors.GREY,
+    )
+    mixed_warning = ft.Container(
+        content=ft.Text(
+            "⚠️ Выбраны разные типы сущностей — убедитесь, что это намеренно.",
+            size=11,
+            color=ft.Colors.ORANGE_900,
+        ),
+        bgcolor=ft.Colors.ORANGE_50,
+        border_radius=6,
+        padding=ft.padding.symmetric(horizontal=8, vertical=4),
+        visible=is_mixed,
     )
     schedule_text = ft.Text(
         (
@@ -1573,6 +1646,7 @@ async def _add_process_card(
                 replace_ids_text,
                 target_text,
                 cleanup_text,
+                mixed_warning,
                 schedule_text,
                 progress_row,
                 message_text,
@@ -1690,6 +1764,8 @@ async def _add_process_card(
                 entity_type,
                 cleanup_mode,
                 auto_confirm,
+                target_type,
+                replace_types,
             )
         except Exception as e:  # noqa: BLE001
             log.warning("restart failed for %s: %s", task_id, e)

@@ -76,8 +76,27 @@ class JobMeta(BaseModel):
     login: str
     replace_ids: list[str]
     target_id: str
+    # Унаследованное поле: тип, когда вся задача однородна. Сохраняется для
+    # обратной совместимости и как фолбэк, если target_type/replace_types пусты.
     entity_type: str = "product"
+    # Тип целевой сущности. Пусто => использовать entity_type.
+    target_type: str = ""
+    # Карта тип-каждого-дубля: {id -> "product"|"variant"|"service"|"bundle"}.
+    # Пусто => считать, что все дубли имеют тип entity_type.
+    replace_types: dict[str, str] = Field(default_factory=dict)
     cleanup_mode: str = "archive"
     auto_confirm: bool = False
     # epoch_ms запланированного запуска (None для immediate)
     scheduled_at_ms: Optional[int] = None
+
+    def effective_target_type(self) -> str:
+        return self.target_type or self.entity_type
+
+    def effective_replace_types(self) -> dict[str, str]:
+        return {pid: self.replace_types.get(pid, self.entity_type) for pid in self.replace_ids}
+
+    def is_mixed(self) -> bool:
+        """True, если в задаче участвует более одного типа сущностей."""
+        types = set(self.effective_replace_types().values())
+        types.add(self.effective_target_type())
+        return len(types) > 1
